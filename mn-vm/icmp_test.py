@@ -1,155 +1,216 @@
 #!/usr/bin/env python
 """
-Live ICMP Telemetry Dashboard for Mininet-WiFi with continuous ARP updates.
-Refreshes the terminal screen in-place at 2 pings/sec and sends gratuitous ARP every 2 seconds.
+Live ICMP Telemetry Dashboard for Mininet-WiFi.
+One ping every 0.5s. Statistics start after a 5-second warmup.
+Tracks drop transitions (normal->drop) and reports dropped packets per transition.
 """
 import sys
 import subprocess
 import re
-import threading
 import time
 from datetime import datetime
 
-def run_gratuitous_arp(gateway_ip, interval=2):
-    """
-    Send gratuitous ARP packets at regular intervals to ensure ONOS detects host location.
-    This helps with WiFi roaming detection.
-    """
-    while True:
-        try:
-            # Send gratuitous ARP using arping
-            subprocess.run(
-                ['arping', '-c', '1', gateway_ip],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=2
-            )
-            time.sleep(interval)
-        except subprocess.TimeoutExpired:
-            pass
-        except Exception as e:
-            # If arping fails, try arp command instead
-            try:
-                subprocess.run(
-                    ['arp', '-s', gateway_ip, '00:00:00:00:00:00'],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=2
-                )
-                time.sleep(interval)
-            except Exception:
-                time.sleep(interval)
 
-def run_live_dashboard(station_name, target_ip, gateway_ip=None):
-    """
-    Run live ICMP telemetry dashboard with ARP updates.
-    
-    Args:
-        station_name: Name of the station
-        target_ip: IP address to ping
-        gateway_ip: Gateway IP for ARP updates (defaults to target_ip if not provided)
-    """
-    if gateway_ip is None:
-        gateway_ip = target_ip
-    
-    # Start ARP background thread
-    arp_thread = threading.Thread(
-        target=run_gratuitous_arp,
-        args=(gateway_ip, 2),  # Send ARP every 2 seconds
-        daemon=True
-    )
-    arp_thread.start()
-    
-    # -O: Reports outstanding (dropped) packets immediately
-    # -i 0.5: 2 pings per second
-    cmd = ['ping', '-O', '-i', '1', target_ip]
-    
-    # Use bufsize=1 for line-buffered output to process results instantly
+def run_live_dashboard(station_name, target_ip):
+
+    cmd = ['ping', '-O', '-i', '0.5', target_ip]
     process = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
     )
-    
-    sent = 0
-    received = 0
-    latest_rtt = "N/A"
-    status = "INITIALIZING..."
-    arp_status = "RUNNING"
-    
-    # Clear screen initially
+
+    # ── Counters ──────────────────────────────────────────────────────────────
+    sent          = 0
+    received      = 0
+    latest_rtt    = "N/A"
+    status        = "INITIALIZING..."
+
+    # Transition tracking
+    transitions   = []   # {"time": datetime, "drops": int, "closed": bool}
+    in_drop       = False
+    current_drops = 0
+
+    # Warmup
+    WARMUP_SECONDS = 5
+    start_time     = time.monotonic()
+    warmed_up      = False
+
     sys.stdout.write('\033[2J\033[H')
-    
+    sys.stdout.flush()
+
+    def format_transitions():
+        if not transitions:
+            return "  (none yet)\n"
+        lines  = f"  {'#':<4} {'Time':<22} {'Drops'}\n"
+        lines += "  " + "-" * 35 + "\n"
+        for i, t in enumerate(transitions, 1):
+            ts   = t["time"].strftime("%H:%M:%S.%f")[:-3]
+            drps = str(t["drops"]) + ("" if t["closed"] else "...")
+            lines += f"  {i:<4} {ts:<22} {drps}\n"
+        return lines
+
     try:
         for line in process.stdout:
-            line = line.strip()
-            # Track the highest sequence number to know exactly how many were sent
-            seq_match = re.search(r'icmp_seq=(\d+)', line)
-            if seq_match:
-                seq = int(seq_match.group(1))
-                sent = max(sent, seq)
-            
-            # Logic for a successful reply
+            line    = line.strip()
+            now     = time.monotonic()
+            elapsed = now - start_time
+
+            # ── Warmup gate ───────────────────────────────────────────────────
+            if elapsed < WARMUP_SECONDS:
+                remaining = WARMUP_SECONDS - elapsed
+                sys.stdout.write(
+                    f"\033[H\033[J\n"
+                    f"  Warming up -- statistics start in {remaining:.1f}s ...\n"
+                )
+                sys.stdout.flush()
+                continue
+
+            if not warmed_up:
+                warmed_up     = True
+                sent          = 0
+                received      = 0
+                in_drop       = False
+                current_drops = 0
+                transitions   = []
+
+            # ── Parse line ────────────────────────────────────────────────────
+            is_drop = False
+
             if "bytes from" in line:
+                sent     += 1
                 received += 1
-                status = "CONNECTED "
+                status    = "CONNECTED  "
                 rtt_match = re.search(r'time=([\d.]+)\s*ms', line)
-                if rtt_match:
-                    latest_rtt = rtt_match.group(1) + " ms"
-            
-            # Logic for a dropped packet (triggered by the -O flag)
+                latest_rtt = (rtt_match.group(1) + " ms") if rtt_match else latest_rtt
+
+                if in_drop:
+                    transitions[-1]["closed"] = True
+                    in_drop       = False
+                    current_drops = 0
+
             elif "no answer yet" in line:
-                status = "LOSS SPYKE "
-                latest_rtt = "DROPPED "
-            
-            # Logic for routing failures
-            elif "Unreachable" in line or "timeout" in line.lower():
-                status = "UNREACHABLE"
-                latest_rtt = "FAIL    "
-            
-            # Calculate live percentages
-            lost = sent - received
-            success_rate = (received / sent * 100) if sent > 0 else 0.0
-            loss_rate = (lost / sent * 100) if sent > 0 else 0.0
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            
-            # \033[H moves the cursor to the top-left corner without flickering the screen
-            # \033[J clears everything below the cursor
-            dashboard = f"""\033[H\033[J
-====================================================
-  LIVE ICMP TELEMETRY: {station_name.upper()} -> {target_ip}
-====================================================
-  Time:          {timestamp}
-  Link Status:   {status}
-  Latest RTT:    {latest_rtt}
-  ARP Status:    {arp_status} (gateway: {gateway_ip})
-----------------------------------------------------
-  Packets Sent:     {sent}
-  Packets Received: {received}
-  Packets Lost:     {lost}
-  Success Rate:     {success_rate:.1f}%
-  Loss Rate:        {loss_rate:.1f}%
-====================================================
-"""
-            sys.stdout.write(dashboard)
+                sent      += 1
+                status     = "LOSS       "
+                latest_rtt = "DROPPED"
+                is_drop    = True
+
+            elif "unreachable" in line.lower() or "timeout" in line.lower():
+                sent      += 1
+                status     = "UNREACHABLE"
+                latest_rtt = "FAIL"
+                is_drop    = True
+
+            else:
+                # Header line or noise -- skip
+                continue
+
+            # ── Transition logic ──────────────────────────────────────────────
+            if is_drop:
+                if not in_drop:
+                    in_drop       = True
+                    current_drops = 1
+                    transitions.append({
+                        "time":   datetime.now(),
+                        "drops":  1,
+                        "closed": False
+                    })
+                else:
+                    current_drops           += 1
+                    transitions[-1]["drops"] = current_drops
+
+            # ── Stats ─────────────────────────────────────────────────────────
+            lost        = sent - received
+            loss_pct    = (lost     / sent * 100) if sent > 0 else 0.0
+            success_pct = (received / sent * 100) if sent > 0 else 0.0
+            n_trans     = len(transitions)
+            closed      = [t for t in transitions if t["closed"]]
+            avg_closed  = (
+                sum(t["drops"] for t in closed) / len(closed) if closed else 0.0
+            )
+            total_per_t = (lost / n_trans) if n_trans > 0 else 0.0
+            timestamp   = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+            # ── Draw ──────────────────────────────────────────────────────────
+            out = (
+                f"\033[H\033[J"
+                f"\n================================================\n"
+                f"  ICMP TELEMETRY: {station_name.upper()} -> {target_ip}\n"
+                f"================================================\n"
+                f"  Time:        {timestamp}\n"
+                f"  Status:      {status}\n"
+                f"  Latest RTT:  {latest_rtt}\n"
+                f"------------------------------------------------\n"
+                f"  Sent:        {sent}\n"
+                f"  Received:    {received}   ({success_pct:.1f}%)\n"
+                f"  Lost:        {lost}   ({loss_pct:.1f}%)\n"
+                f"------------------------------------------------\n"
+                f"  Drop transitions:          {n_trans}\n"
+            )
+
+            if n_trans > 0:
+                out += (
+                    f"  Total lost / transitions:  {total_per_t:.2f} pkts\n"
+                    f"  Avg drops / closed burst:  {avg_closed:.2f} pkts\n"
+                    f"================================================\n"
+                    f"  TRANSITION LOG\n"
+                    f"================================================\n"
+                    + format_transitions()
+                )
+
+            out += "================================================\n"
+
+            sys.stdout.write(out)
             sys.stdout.flush()
-    
+
     except KeyboardInterrupt:
-        sys.stdout.write("\nDashboard terminated by user.\n")
+        pass
+    finally:
         process.terminate()
+        _final_report(station_name, target_ip, sent, received, transitions, start_time)
+
+
+def _final_report(station_name, target_ip, sent, received, transitions, start_time):
+    lost        = sent - received
+    success_pct = (received / sent * 100) if sent > 0 else 0.0
+    loss_pct    = (lost     / sent * 100) if sent > 0 else 0.0
+    n_trans     = len(transitions)
+    closed      = [t for t in transitions if t["closed"]]
+    elapsed     = time.monotonic() - start_time
+
+    print("\n\n" + "=" * 50)
+    print("  FINAL REPORT")
+    print("=" * 50)
+    print(f"  {station_name}  ->  {target_ip}")
+    print(f"  Duration: {elapsed:.1f}s  (after 5s warmup)")
+    print("-" * 50)
+    print(f"  Sent:      {sent}")
+    print(f"  Received:  {received}  ({success_pct:.1f}%)")
+    print(f"  Lost:      {lost}  ({loss_pct:.1f}%)")
+    print("-" * 50)
+    print(f"  Drop transitions (normal->drop): {n_trans}")
+
+    if n_trans > 0:
+        print(f"  Total lost / transitions:        {lost / n_trans:.2f} pkts/transition")
+    if closed:
+        avg = sum(t["drops"] for t in closed) / len(closed)
+        print(f"  Avg drops / closed burst:        {avg:.2f} pkts  ({len(closed)} closed)")
+
+    if transitions:
+        print(f"\n  {'#':<4} {'Time':<22} {'Drops':<8} {'Closed?'}")
+        print("  " + "-" * 42)
+        for i, t in enumerate(transitions, 1):
+            ts = t["time"].strftime("%H:%M:%S.%f")[:-3]
+            print(f"  {i:<4} {ts:<22} {t['drops']:<8} {'yes' if t['closed'] else 'ongoing'}")
+
+    print("=" * 50 + "\n")
+
 
 def main():
     if len(sys.argv) < 3:
-        print("Usage: python icmp_test.py <station_name> <target_ip> [gateway_ip]")
-        print()
-        print("  station_name: Name of the station (e.g., sta1, sta2)")
-        print("  target_ip:    IP address to ping (e.g., 10.0.0.2)")
-        print("  gateway_ip:   Optional - IP for gratuitous ARP (defaults to target_ip)")
+        print("Usage: python icmp_test.py <station_name> <target_ip>")
         sys.exit(1)
-    
-    station_name = sys.argv[1].lower()
-    target_ip = sys.argv[2]
-    gateway_ip = sys.argv[3] if len(sys.argv) > 3 else None
-    
-    run_live_dashboard(station_name, target_ip, gateway_ip)
+
+    run_live_dashboard(sys.argv[1].lower(), sys.argv[2])
+
 
 if __name__ == '__main__':
     main()
